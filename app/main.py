@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -5,10 +6,56 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from opentelemetry import trace, metrics, _logs
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, ConsoleMetricExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, ConsoleLogRecordExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+
+# Setup OpenTelemetry Exporters
+otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+trace_provider = TracerProvider()
+if otlp_endpoint:
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    trace_provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces")))
+trace_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(trace_provider)
+tracer = trace.get_tracer("order-tracker")
+
+metric_readers = [PeriodicExportingMetricReader(ConsoleMetricExporter(), export_interval_millis=1000)]
+if otlp_endpoint:
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    metric_readers.append(PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=f"{otlp_endpoint}/v1/metrics"), export_interval_millis=1000))
+
+meter_provider = MeterProvider(metric_readers=metric_readers)
+metrics.set_meter_provider(meter_provider)
+meter = metrics.get_meter("order-tracker")
+
+request_counter = meter.create_counter(
+    "http_requests_total",
+    description="Total HTTP requests",
+    unit="1",
+)
+
+logger_provider = LoggerProvider()
+logger_provider.add_log_record_processor(SimpleLogRecordProcessor(ConsoleLogRecordExporter()))
+if otlp_endpoint:
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    logger_provider.add_log_record_processor(SimpleLogRecordProcessor(OTLPLogExporter(endpoint=f"{otlp_endpoint}/v1/logs")))
+_logs.set_logger_provider(logger_provider)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("order-tracker")
+logger.addHandler(LoggingHandler(logger_provider=logger_provider))
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
@@ -77,6 +124,24 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
+
+
+@app.middleware("http")
+async def telemetry_middleware(request: Request, call_next):
+    route = request.url.path
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception as exc:
+        logger.error(f"Error handling request {route}: {exc}")
+        raise exc
+    finally:
+        request_counter.add(1, {"route": route, "status_code": status_code})
+        logger.info(f"Request {route} completed with status {status_code}")
+
 
 
 @app.get("/")
